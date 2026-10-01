@@ -266,6 +266,8 @@ export const hosts = table("hosts", {
   expiryHandling: varchar("expiryHandling", { length: 24 }).notNull().default("none"),
   trafficLimit: bigint("trafficLimit", { mode: "number" }).notNull().default(0),
   trafficMeasureMode: varchar("trafficMeasureMode", { length: 16 }).notNull().default("both"),
+  trafficFailoverEnabled: boolean("trafficFailoverEnabled").notNull().default(false),
+  trafficFailoverThresholdPercent: int("trafficFailoverThresholdPercent").notNull().default(95),
   telegramTrafficAlertEnabled: boolean("telegramTrafficAlertEnabled").notNull().default(false),
   trafficAlertThresholdPercent: int("trafficAlertThresholdPercent").notNull().default(20),
   telegramRenewalReminderEnabled: boolean("telegramRenewalReminderEnabled").notNull().default(false),

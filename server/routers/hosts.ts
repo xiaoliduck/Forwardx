@@ -233,6 +233,8 @@ function hostTrafficConfigPayload(input: {
   stoppedAt?: string | null;
   trafficLimit?: number;
   trafficMeasureMode?: "outbound" | "both" | "max";
+  trafficFailoverEnabled?: boolean;
+  trafficFailoverThresholdPercent?: number;
   telegramTrafficAlertEnabled?: boolean;
   trafficAlertThresholdPercent?: number;
   telegramRenewalReminderEnabled?: boolean;
@@ -253,6 +255,8 @@ function hostTrafficConfigPayload(input: {
     stoppedAt,
     trafficLimit: Math.max(0, Math.floor(Number(input.trafficLimit || 0))),
     trafficMeasureMode: normalizeHostTrafficMeasureMode(input.trafficMeasureMode),
+    trafficFailoverEnabled: !!input.trafficFailoverEnabled,
+    trafficFailoverThresholdPercent: Math.min(100, Math.max(1, Math.floor(Number(input.trafficFailoverThresholdPercent) || 95))),
     telegramTrafficAlertEnabled: !!input.telegramTrafficAlertEnabled,
     trafficAlertThresholdPercent: normalizeTrafficAlertThresholdPercent(input.trafficAlertThresholdPercent),
     telegramRenewalReminderEnabled: !!input.telegramRenewalReminderEnabled,
@@ -1028,6 +1032,8 @@ export const hostsRouter = router({
         stoppedAt: optionalDateInputSchema,
         trafficLimit: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
         trafficMeasureMode: hostTrafficMeasureModeSchema.optional(),
+        trafficFailoverEnabled: z.boolean().optional(),
+        trafficFailoverThresholdPercent: z.number().int().min(1).max(100).optional(),
         telegramTrafficAlertEnabled: z.boolean().optional(),
         trafficAlertThresholdPercent: z.number().int().min(1).max(99).optional(),
         telegramRenewalReminderEnabled: z.boolean().optional(),
@@ -1059,7 +1065,7 @@ export const hostsRouter = router({
         const agentToken = nanoid(32);
         const trafficConfig = ctx.user.role === "admin"
           ? hostTrafficConfigPayload(input)
-          : { purchasedAt: null, stoppedAt: null, trafficLimit: 0, trafficMeasureMode: "both", telegramTrafficAlertEnabled: false, trafficAlertThresholdPercent: 20, telegramRenewalReminderEnabled: false, renewalReminderDays: 3, billingCycleMonths: 1, billingMonth: 1, billingDay: 1, expiryHandling: "none", trafficAutoReset: false, trafficResetDay: 1 };
+          : { purchasedAt: null, stoppedAt: null, trafficLimit: 0, trafficMeasureMode: "both", trafficFailoverEnabled: false, trafficFailoverThresholdPercent: 95, telegramTrafficAlertEnabled: false, trafficAlertThresholdPercent: 20, telegramRenewalReminderEnabled: false, renewalReminderDays: 3, billingCycleMonths: 1, billingMonth: 1, billingDay: 1, expiryHandling: "none", trafficAutoReset: false, trafficResetDay: 1 };
         if (ctx.user.role === "admin" && (trafficConfig.telegramTrafficAlertEnabled || trafficConfig.telegramRenewalReminderEnabled)) {
           await assertTelegramBotConfiguredForHostReminder();
         }
@@ -1117,6 +1123,8 @@ export const hostsRouter = router({
         stoppedAt: optionalDateInputSchema,
         trafficLimit: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
         trafficMeasureMode: hostTrafficMeasureModeSchema.optional(),
+        trafficFailoverEnabled: z.boolean().optional(),
+        trafficFailoverThresholdPercent: z.number().int().min(1).max(100).optional(),
         telegramTrafficAlertEnabled: z.boolean().optional(),
         trafficAlertThresholdPercent: z.number().int().min(1).max(99).optional(),
         telegramRenewalReminderEnabled: z.boolean().optional(),
@@ -1180,7 +1188,7 @@ export const hostsRouter = router({
               (data as any).lastDdnsError = null;
             }
           }
-          const hasTrafficConfigInput = ["purchasedAt", "stoppedAt", "trafficLimit", "trafficMeasureMode", "telegramTrafficAlertEnabled", "trafficAlertThresholdPercent", "telegramRenewalReminderEnabled", "renewalReminderDays", "billingCycleMonths", "billingMonth", "billingDay", "expiryHandling", "trafficAutoReset", "trafficResetDay"].some((key) => (data as any)[key] !== undefined);
+          const hasTrafficConfigInput = ["purchasedAt", "stoppedAt", "trafficLimit", "trafficMeasureMode", "trafficFailoverEnabled", "trafficFailoverThresholdPercent", "telegramTrafficAlertEnabled", "trafficAlertThresholdPercent", "telegramRenewalReminderEnabled", "renewalReminderDays", "billingCycleMonths", "billingMonth", "billingDay", "expiryHandling", "trafficAutoReset", "trafficResetDay"].some((key) => (data as any)[key] !== undefined);
           if (hasTrafficConfigInput) {
             const purchasedAt = (data as any).purchasedAt !== undefined
               ? parseOptionalDateInput((data as any).purchasedAt, "机器购买时间")
@@ -1193,6 +1201,8 @@ export const hostsRouter = router({
             if ((data as any).stoppedAt !== undefined) (data as any).stoppedAt = stoppedAt;
             if ((data as any).trafficLimit !== undefined) (data as any).trafficLimit = Math.max(0, Math.floor(Number((data as any).trafficLimit) || 0));
             if ((data as any).trafficMeasureMode !== undefined) (data as any).trafficMeasureMode = normalizeHostTrafficMeasureMode((data as any).trafficMeasureMode);
+            if ((data as any).trafficFailoverEnabled !== undefined) (data as any).trafficFailoverEnabled = !!(data as any).trafficFailoverEnabled;
+            if ((data as any).trafficFailoverThresholdPercent !== undefined) (data as any).trafficFailoverThresholdPercent = Math.min(100, Math.max(1, Math.floor(Number((data as any).trafficFailoverThresholdPercent) || 95)));
             if ((data as any).telegramTrafficAlertEnabled !== undefined) (data as any).telegramTrafficAlertEnabled = !!(data as any).telegramTrafficAlertEnabled;
             if ((data as any).trafficAlertThresholdPercent !== undefined) (data as any).trafficAlertThresholdPercent = normalizeTrafficAlertThresholdPercent((data as any).trafficAlertThresholdPercent);
             if ((data as any).telegramRenewalReminderEnabled !== undefined) (data as any).telegramRenewalReminderEnabled = !!(data as any).telegramRenewalReminderEnabled;
@@ -1214,7 +1224,7 @@ export const hostsRouter = router({
             }
           }
         } else {
-          for (const field of ["purchasedAt", "stoppedAt", "trafficLimit", "trafficMeasureMode", "telegramTrafficAlertEnabled", "trafficAlertThresholdPercent", "telegramRenewalReminderEnabled", "renewalReminderDays", "billingCycleMonths", "billingMonth", "billingDay", "expiryHandling", "trafficAutoReset", "trafficResetDay", "ddnsEnabled", "ddnsDomain", "ddnsRecordType", "ddnsIpVersion"] as const) delete (data as any)[field];
+          for (const field of ["purchasedAt", "stoppedAt", "trafficLimit", "trafficMeasureMode", "trafficFailoverEnabled", "trafficFailoverThresholdPercent", "telegramTrafficAlertEnabled", "trafficAlertThresholdPercent", "telegramRenewalReminderEnabled", "renewalReminderDays", "billingCycleMonths", "billingMonth", "billingDay", "expiryHandling", "trafficAutoReset", "trafficResetDay", "ddnsEnabled", "ddnsDomain", "ddnsRecordType", "ddnsIpVersion"] as const) delete (data as any)[field];
         }
         if (ctx.user.role !== "admin") {
           for (const field of hostProtocolPolicyFields) delete (data as any)[field];
@@ -1222,6 +1232,8 @@ export const hostsRouter = router({
         const protocolPolicyChanged = hostProtocolPolicyFields.some((key) =>
           (data as any)[key] !== undefined && !!(data as any)[key] !== !!(host as any)[key]
         );
+        const hostTrafficFailoverConfigChanged = ["trafficLimit", "trafficMeasureMode", "trafficFailoverEnabled", "trafficFailoverThresholdPercent"]
+          .some((key) => (data as any)[key] !== undefined);
         const portRangeChanged = ["portRangeStart", "portRangeEnd"].some((key) =>
           (data as any)[key] !== undefined && Number((data as any)[key] ?? 0) !== Number((host as any)[key] ?? 0)
         ) || ((data as any).portAllowlist !== undefined && nextPortAllowlist !== String((host as any).portAllowlist || ""));
@@ -1240,6 +1252,11 @@ export const hostsRouter = router({
           });
         }
         await db.updateHost(id, data as any);
+        if (hostTrafficFailoverConfigChanged) {
+          await db.scheduleForwardGroupsForHostTrafficChange(id, true).catch((error: unknown) => {
+            console.warn(`[HostTraffic] quota failover scheduling failed host=${id}: ${error instanceof Error ? error.message : String(error)}`);
+          });
+        }
         if (ddnsConfigChanged) {
           scheduleHostDdnsUpdate({ ...host, ...(data as any), id }, "host-ddns-config-updated", { force: true });
         }
@@ -1344,7 +1361,11 @@ export const hostsRouter = router({
         const host = await db.getHostById(input.hostId);
         if (!host) throw new Error("主机不存在");
         appendPanelLog("info", `[HostTraffic] reset host=${host.id} name=${host.name} reason=manual-admin-reset`);
-        return db.resetHostTraffic(input.hostId);
+        const result = await db.resetHostTraffic(input.hostId);
+        await db.scheduleForwardGroupsForHostTrafficChange(input.hostId, true).catch((error: unknown) => {
+          console.warn(`[HostTraffic] quota failover refresh failed host=${input.hostId}: ${error instanceof Error ? error.message : String(error)}`);
+        });
+        return result;
       }),
     correctTraffic: adminProcedure
       .input(z.object({
@@ -1359,7 +1380,11 @@ export const hostsRouter = router({
           "info",
           `[HostTraffic] correct host=${host.id} name=${host.name} usedBytes=${input.usedBytes} mode=${measureMode} reason=manual-admin-correction`,
         );
-        return db.correctHostTraffic(input.hostId, input.usedBytes, measureMode);
+        const result = await db.correctHostTraffic(input.hostId, input.usedBytes, measureMode);
+        await db.scheduleForwardGroupsForHostTrafficChange(input.hostId, true).catch((error: unknown) => {
+          console.warn(`[HostTraffic] quota failover refresh failed host=${input.hostId}: ${error instanceof Error ? error.message : String(error)}`);
+        });
+        return result;
       }),
     watchMetrics: protectedProcedure
       .input(z.object({ hostIds: z.array(z.number()).max(200) }))

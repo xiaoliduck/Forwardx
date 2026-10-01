@@ -94,6 +94,9 @@ async function runMonthlyTrafficReset() {
     for (const host of hostsToReset as any[]) {
       await db.resetHostTraffic(Number(host.id));
       await db.markHostTrafficReset(Number(host.id));
+      await db.scheduleForwardGroupsForHostTrafficChange(Number(host.id), true).catch((error: unknown) => {
+        console.warn(`[Scheduler] Host traffic failover refresh failed host=${host.id}: ${error instanceof Error ? error.message : String(error)}`);
+      });
       console.log(`[Scheduler] Auto-reset host traffic for host ${host.id} (${host.name})`);
     }
     if (hostsToReset.length > 0) {

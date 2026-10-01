@@ -15,6 +15,7 @@ type ForwardGroupSwitchNotifyPayload = {
   toValue?: string | null;
   reason: string;
   detail?: string | null;
+  unavailable?: boolean;
 };
 
 function escapeHtml(value: unknown) {
@@ -42,7 +43,9 @@ async function telegramForwardGroupSwitchEnabled() {
 }
 
 function forwardGroupSwitchMessage(payload: ForwardGroupSwitchNotifyPayload) {
-  const title = payload.groupMode === "entry" ? "ForwardX 入口组自动切换告警" : "ForwardX 转发组自动切换告警";
+  const title = payload.unavailable
+    ? payload.groupMode === "entry" ? "ForwardX 入口组无可用入口告警" : "ForwardX 转发组无可用备用成员告警"
+    : payload.groupMode === "entry" ? "ForwardX 入口组自动切换告警" : "ForwardX 转发组自动切换告警";
   const modeLabel = payload.groupMode === "entry" ? "入口组" : "转发组";
   const lines = [
     `<b>▌ ${escapeHtml(title)}</b>`,
@@ -54,8 +57,8 @@ function forwardGroupSwitchMessage(payload: ForwardGroupSwitchNotifyPayload) {
     `<b>原因</b>：${escapeHtml(payload.reason)}`,
     payload.detail ? `<b>详情</b>：${escapeHtml(payload.detail)}` : "",
     "",
-    `<b>切换前</b>：${escapeHtml(valueOrDash(payload.fromLabel))} / <code>${escapeHtml(valueOrDash(payload.fromValue))}</code>`,
-    `<b>切换后</b>：${escapeHtml(valueOrDash(payload.toLabel))} / <code>${escapeHtml(valueOrDash(payload.toValue))}</code>`,
+    `<b>${payload.unavailable ? "当前入口" : "切换前"}</b>：${escapeHtml(valueOrDash(payload.fromLabel))} / <code>${escapeHtml(valueOrDash(payload.fromValue))}</code>`,
+    `<b>${payload.unavailable ? "备用状态" : "切换后"}</b>：${escapeHtml(valueOrDash(payload.toLabel))} / <code>${escapeHtml(valueOrDash(payload.toValue))}</code>`,
     `<b>时间</b>：${escapeHtml(formatTime())}`,
   ].filter(Boolean);
   return lines.join("\n");
@@ -81,4 +84,10 @@ export async function notifyForwardGroupSwitch(payload: ForwardGroupSwitchNotify
   if (sent > 0 || failed > 0) {
     console.info(`[Telegram] Forward group switch notify group=${payload.groupId} sent=${sent} failed=${failed}`);
   }
+}
+
+export async function notifyForwardGroupQuotaUnavailable(
+  payload: Omit<ForwardGroupSwitchNotifyPayload, "unavailable">,
+) {
+  return notifyForwardGroupSwitch({ ...payload, unavailable: true });
 }

@@ -64,7 +64,7 @@ import {
   nextForwardGroupChinaHealthExpiryAt,
   nextForwardGroupHealthRecheckAt,
 } from "../forwardGroupHealthRecheck";
-import { notifyForwardGroupSwitch } from "../forwardGroupSwitchNotifier";
+import { notifyForwardGroupQuotaUnavailable, notifyForwardGroupSwitch } from "../forwardGroupSwitchNotifier";
 import { trafficBillingUserLockKey, withKeyedTaskLock } from "../keyedTaskLock";
 import {
   releaseHostPortReservations,
@@ -78,6 +78,7 @@ import { sqlBool } from "./repositoryUtils";
 import { normalizeExitGroupStrategy } from "@shared/exitStrategy";
 import { MAX_FORWARD_GROUP_MEMBERS } from "../../shared/forwardGroup";
 import { getLastAuthenticatedAgentActivity } from "../agentActivity";
+import { getHostTrafficSummary } from "./metricsRepository";
 import {
   getPresenceCapableHostLivenessSnapshot,
   primePresenceCapableHosts,
@@ -267,6 +268,7 @@ export async function primeForwardGroupHostLivenessDeadlines() {
 const DEFAULT_CHINA_HEALTH_TARGET = "www.189.cn:80";
 const lastDdnsEventByKey = new Map<string, string>();
 const exactDdnsReconciledGroups = new Map<number, string>();
+const trafficFailoverReachedByHost = new Map<number, string>();
 
 export function normalizeChinaHealthTarget(raw: unknown) {
   const source = String(raw || "").trim() || DEFAULT_CHINA_HEALTH_TARGET;
@@ -753,6 +755,77 @@ async function forwardGroupMemberLabel(member: any | null | undefined, fallbackI
   return fallbackId ? `成员 #${fallbackId}` : `成员 #${member.id || "-"}`;
 }
 
+type HostTrafficFailoverState = {
+  hostId: number;
+  hostName: string;
+  enabled: boolean;
+  reached: boolean;
+  usedBytes: number;
+  limitBytes: number;
+  thresholdPercent: number;
+};
+
+function hostTrafficUsageBytes(traffic: any, mode: unknown) {
+  const bytesIn = Math.max(0, Number(traffic?.bytesIn || 0));
+  const bytesOut = Math.max(0, Number(traffic?.bytesOut || 0));
+  if (mode === "outbound") return bytesOut;
+  if (mode === "max") return Math.max(bytesIn, bytesOut);
+  return bytesIn + bytesOut;
+}
+
+function hostTrafficFailoverState(host: any, traffic: any): HostTrafficFailoverState | null {
+  const hostId = Number(host?.id || 0);
+  const limitBytes = Math.max(0, Number(host?.trafficLimit || 0));
+  const enabled = dbBool(host?.trafficFailoverEnabled) && limitBytes > 0;
+  if (!hostId || !enabled) return null;
+  const thresholdPercent = Math.min(100, Math.max(1, Math.floor(Number(host?.trafficFailoverThresholdPercent) || 95)));
+  const usedBytes = hostTrafficUsageBytes(traffic, host?.trafficMeasureMode);
+  return {
+    hostId,
+    hostName: String(host?.name || `主机 #${hostId}`),
+    enabled,
+    reached: usedBytes * 100 >= limitBytes * thresholdPercent,
+    usedBytes,
+    limitBytes,
+    thresholdPercent,
+  };
+}
+
+async function loadMemberTrafficFailoverStates(members: any[], hostById: Map<number, any>) {
+  const hostIdByMemberId = new Map<number, number>();
+  await Promise.all((members || []).map(async (member) => {
+    if (!dbBool(member?.isEnabled, true)) return;
+    const memberId = Number(member?.id || 0);
+    const hostId = await memberEntryHostId(member).catch(() => 0);
+    if (memberId > 0 && hostId > 0) hostIdByMemberId.set(memberId, hostId);
+  }));
+  const hostIds = Array.from(new Set(hostIdByMemberId.values()));
+  if (hostIds.length === 0) return new Map<number, HostTrafficFailoverState>();
+  const trafficRows = await getHostTrafficSummary(hostIds);
+  const trafficByHostId = new Map((trafficRows as any[]).map((row) => [Number(row.hostId), row]));
+  const states = new Map<number, HostTrafficFailoverState>();
+  for (const [memberId, hostId] of hostIdByMemberId) {
+    const host = hostById.get(hostId) || await getHostById(hostId).catch(() => null);
+    const state = hostTrafficFailoverState(host, trafficByHostId.get(hostId));
+    if (state) states.set(memberId, state);
+  }
+  return states;
+}
+
+async function currentMemberTrafficQuotaReached(member: any) {
+  const hostId = await memberEntryHostId(member).catch(() => 0);
+  if (hostId <= 0) return false;
+  const host = await getHostById(hostId).catch(() => null);
+  if (!dbBool((host as any)?.trafficFailoverEnabled) || Number((host as any)?.trafficLimit || 0) <= 0) return false;
+  const [traffic] = await getHostTrafficSummary([hostId]);
+  return !!hostTrafficFailoverState(host, traffic)?.reached;
+}
+
+function hostTrafficFailoverDetail(state: HostTrafficFailoverState) {
+  const gib = 1024 ** 3;
+  return `已用 ${(state.usedBytes / gib).toFixed(1)} GB / ${(state.limitBytes / gib).toFixed(1)} GB`;
+}
+
 function normalizeHealthReason(message: unknown) {
   const text = String(message || "").trim();
   if (!text) return "入口不可用";
@@ -771,6 +844,52 @@ function switchNotifySuppressed(options: ForwardGroupFailoverOptions) {
 
 function groupSwitchNotifyEnabled(group: any) {
   return !!group?.telegramSwitchNotifyEnabled;
+}
+
+async function alertForwardGroupTrafficQuotaUnavailable(input: {
+  group: any;
+  members: any[];
+  quotaByMemberId: Map<number, HostTrafficFailoverState>;
+  excludedMemberIds: number[];
+  options: ForwardGroupFailoverOptions;
+}) {
+  const affected = Array.from(new Set(input.excludedMemberIds))
+    .map((memberId) => input.quotaByMemberId.get(memberId))
+    .filter((state): state is HostTrafficFailoverState => !!state?.reached);
+  if (affected.length === 0) return "";
+  const names = Array.from(new Set(affected.map((state) => `${state.hostName}（${state.thresholdPercent}%）`)));
+  const marker = "流量阈值故障转移告警";
+  const reason = `${marker}：没有健康备用成员可切换；达到阈值的主机：${names.join("、")}`;
+  if (String(input.group?.lastMessage || "").startsWith(marker)) {
+    return reason;
+  }
+
+  const active = input.members.find((member) => Number(member?.id || 0) === Number(input.group?.activeMemberId || 0));
+  const activeLabel = await forwardGroupMemberLabel(active, Number(input.group?.activeMemberId || 0) || null);
+  await insertForwardGroupEvent(
+    Number(input.group?.id || 0),
+    Number(active?.id || 0) || null,
+    "traffic-quota-alert",
+    reason,
+  );
+  if (groupSwitchNotifyEnabled(input.group) && !switchNotifySuppressed(input.options)) {
+    void notifyForwardGroupQuotaUnavailable({
+      groupId: Number(input.group.id),
+      groupName: String(input.group.name || "转发组"),
+      groupMode: groupModeOf(input.group) === "entry" ? "entry" : "failover",
+      domain: String(input.group.domain || ""),
+      recordType: normalizeForwardGroupRecordType(input.group.recordType),
+      fromLabel: activeLabel || "当前解析",
+      fromValue: String(input.group.lastDdnsValue || ""),
+      toLabel: "没有健康备用成员",
+      toValue: "-",
+      reason: "所有备用成员都不可用或已达到流量阈值，保留当前解析",
+      detail: `已达阈值：${names.join("、")}`,
+    }).catch((error) => {
+      console.warn(`[ForwardGroup] quota alert notify failed group=${input.group.id}: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
+  return reason;
 }
 
 export async function getForwardGroups(userId?: number, options: { includeRuntime?: boolean; ids?: number[] } = {}) {
@@ -1798,9 +1917,14 @@ async function failoverAgentSelectionStillCurrent(group: any, active: any, next:
     || (next && !enabledMemberIds.has(Number(next.id || 0)))) return false;
   if (active && !(await memberAgentSelectionStillCurrent(active))) return false;
   if (next && !(await memberAgentSelectionStillCurrent(next))) return false;
+  const activeQuotaState = active
+    ? (group as any).trafficQuotaByMemberId?.get(Number(active.id || 0)) as HostTrafficFailoverState | undefined
+    : undefined;
+  if (activeQuotaState?.reached && !(await currentMemberTrafficQuotaReached(active))) return false;
   if (next && Number(next.id || 0) !== Number(active?.id || 0)) {
     const nextLiveness = await resolveMemberAgentLiveness(next);
     if (!nextLiveness.available) return false;
+    if (await currentMemberTrafficQuotaReached(next)) return false;
   }
   return true;
 }
@@ -1838,14 +1962,24 @@ export async function updateForwardGroupMemberAgentHealth(input: {
   return true;
 }
 
-async function firstAvailableResolvableMember(members: any[], group: any, recordType: ForwardGroupRecordType) {
+async function firstAvailableResolvableMember(
+  members: any[],
+  group: any,
+  recordType: ForwardGroupRecordType,
+  trafficQuotaByMemberId = new Map<number, HostTrafficFailoverState>(),
+) {
   const chinaHealthEnabled = dbBool(group?.chinaHealthCheckEnabled);
   const now = Date.now();
   const failoverMs = forwardGroupFailoverDelayMs(group);
   const activeMemberId = Number(group?.activeMemberId || 0);
   let pendingChinaHealth = false;
+  const quotaExcludedMemberIds: number[] = [];
   for (const member of members) {
     if (!dbBool(member?.isEnabled, true)) continue;
+    if (trafficQuotaByMemberId.get(Number(member.id || 0))?.reached) {
+      quotaExcludedMemberIds.push(Number(member.id || 0));
+      continue;
+    }
     const value = await memberDdnsValue(member, recordType).catch(() => "");
     if (!value) continue;
     const liveness = await resolveMemberAgentLiveness(member, now);
@@ -1858,6 +1992,7 @@ async function firstAvailableResolvableMember(members: any[], group: any, record
           pendingChinaHealth,
           agentFailurePending: true,
           agentLivenessRecheckAt: failoverAt,
+          quotaExcludedMemberIds,
         };
       }
       continue;
@@ -1880,6 +2015,7 @@ async function firstAvailableResolvableMember(members: any[], group: any, record
       pendingChinaHealth,
       agentFailurePending: false,
       agentLivenessRecheckAt: null,
+      quotaExcludedMemberIds,
     };
   }
   return {
@@ -1888,6 +2024,7 @@ async function firstAvailableResolvableMember(members: any[], group: any, record
     pendingChinaHealth,
     agentFailurePending: false,
     agentLivenessRecheckAt: null,
+    quotaExcludedMemberIds,
   };
 }
 
@@ -3657,6 +3794,31 @@ async function activeForwardGroupIdsForHost(hostId: number) {
   }).map((group: any) => Number(group.id || 0));
 }
 
+export async function scheduleForwardGroupsForHostTrafficChange(hostId: number, force = false) {
+  const id = Number(hostId || 0);
+  if (!Number.isInteger(id) || id <= 0) return 0;
+  const host = await getHostById(id).catch(() => null);
+  const limit = Math.max(0, Number((host as any)?.trafficLimit || 0));
+  const enabled = dbBool((host as any)?.trafficFailoverEnabled) && limit > 0;
+  let state: HostTrafficFailoverState | null = null;
+  if (enabled) {
+    const [traffic] = await getHostTrafficSummary([id]);
+    state = hostTrafficFailoverState(host, traffic);
+  }
+  const signature = state
+    ? `${state.limitBytes}:${state.thresholdPercent}:${String((host as any)?.trafficMeasureMode || "both")}:${state.reached ? 1 : 0}`
+    : "disabled";
+  const previousSignature = trafficFailoverReachedByHost.get(id);
+  trafficFailoverReachedByHost.set(id, signature);
+  const transitioned = previousSignature === undefined
+    ? !!state?.reached
+    : previousSignature !== signature;
+  if (!force && !transitioned) return 0;
+  const groupIds = await activeForwardGroupIdsForHost(id);
+  scheduleForwardGroupFailover(groupIds);
+  return groupIds.length;
+}
+
 export async function runForwardGroupsForHostAddressChange(hostId: number, reason = "host-address-changed") {
   const id = Number(hostId || 0);
   const activeGroupIds = await activeForwardGroupIdsForHost(id);
@@ -3685,7 +3847,7 @@ async function latestTcping(ruleId: number) {
   return result[0];
 }
 
-async function evaluateMemberHealth(member: any, group: any) {
+async function evaluateMemberHealth(member: any, group: any, trafficQuotaState?: HostTrafficFailoverState) {
   const db = await getDb();
   const now = nowDate();
   const agentLiveness = await resolveMemberAgentLiveness(member, now.getTime());
@@ -3699,9 +3861,13 @@ async function evaluateMemberHealth(member: any, group: any) {
   let agentFailureFinal = false;
   let allRuleHealthAgentFinal = false;
   let nextProbeExpiryAt: number | null = null;
+  const trafficQuotaExceeded = !!trafficQuotaState?.reached;
 
   if (!dbBool(member?.isEnabled)) {
     message = "Member disabled";
+  } else if (trafficQuotaExceeded) {
+    observedFailureSince = new Date(now.getTime() - forwardGroupFailoverDelayMs(group));
+    message = `主机流量达到 ${trafficQuotaState?.thresholdPercent}% 阈值`;
   } else if (childRules.length === 0) {
     message = "No forwarding rule is using this group yet";
   } else {
@@ -3864,7 +4030,7 @@ async function evaluateMemberHealth(member: any, group: any) {
     } as any).where(eq(forwardGroupMembers.id, member.id));
   }
 
-  const failedLongEnough = agentFailureFinal
+  const failedLongEnough = trafficQuotaExceeded || agentFailureFinal
     || (!!failureSince && Date.now() - failureSince.getTime() >= forwardGroupFailoverDelayMs(group));
   const recoveredLongEnough = (healthy && allRuleHealthAgentFinal)
     || (!!healthySince && Date.now() - healthySince.getTime() >= forwardGroupRecoverDelayMs(group));
@@ -3881,6 +4047,8 @@ async function evaluateMemberHealth(member: any, group: any) {
     recoveredLongEnough,
     nextProbeExpiryAt,
     agentLivenessSignature: agentLiveness.signature,
+    trafficQuotaExceeded,
+    trafficQuotaState: trafficQuotaExceeded ? trafficQuotaState : null,
   };
 }
 
@@ -3996,6 +4164,7 @@ async function syncEntryGroupDdns(group: any, ddnsSettings: any, options: Forwar
   const previousValues = new Set(previousValue.split(",").map((value) => value.trim()).filter(Boolean));
   const values: string[] = [];
   const excluded: string[] = [];
+  const quotaExcludedMemberIds: number[] = [];
   const healthWindows: any[] = [];
   const initialHealthSnapshot = new Map<number, string>();
   const initialAgentLivenessSnapshot = new Map<number, string>();
@@ -4037,7 +4206,12 @@ async function syncEntryGroupDdns(group: any, ddnsSettings: any, options: Forwar
         : chinaHealthEnabled
           ? forwardGroupChinaHealthStateAt(member, chinaHealthNow)
           : forwardGroupAgentHealthStateAt(member, chinaHealthNow);
-    if (!liveness.available) observedFailureSince = liveness.failureSince || healthNow;
+    const trafficQuotaState = (group as any).trafficQuotaByMemberId?.get(memberId) as HostTrafficFailoverState | undefined;
+    if (trafficQuotaState?.reached) {
+      healthStatus = "unhealthy";
+      observedFailureSince = new Date(chinaHealthNow - failoverMs);
+      quotaExcludedMemberIds.push(memberId);
+    } else if (!liveness.available) observedFailureSince = liveness.failureSince || healthNow;
     if (healthStatus === "pending" && (!toDate(checkedAt) || !agentHealthSampleIsCurrent(liveness, checkedAt))) {
       const waitingSince = liveness.lastOfflineAt
         ? new Date(liveness.lastOfflineAt)
@@ -4167,6 +4341,10 @@ async function syncEntryGroupDdns(group: any, ddnsSettings: any, options: Forwar
       }
       if (seen.size !== initialHealthSnapshot.size) return false;
     }
+    for (const member of members) {
+      const quotaState = (group as any).trafficQuotaByMemberId?.get(Number(member.id || 0)) as HostTrafficFailoverState | undefined;
+      if (quotaState && quotaState.reached !== await currentMemberTrafficQuotaReached(member)) return false;
+    }
     return true;
   };
   const retryChangedAgentSelection = () => {
@@ -4174,6 +4352,13 @@ async function syncEntryGroupDdns(group: any, ddnsSettings: any, options: Forwar
   };
   const joined = values.join(",");
   const excludedSuffix = excluded.length > 0 ? `；已临时剔除 ${excluded.length} 个不健康入口` : "";
+  const quotaExcludedLabels = Array.from(new Set(quotaExcludedMemberIds
+    .map((memberId) => (group as any).trafficQuotaByMemberId?.get(memberId) as HostTrafficFailoverState | undefined)
+    .filter((state): state is HostTrafficFailoverState => !!state?.reached)
+    .map((state) => `${state.hostName} 达到 ${state.thresholdPercent}% 阈值`)));
+  const quotaExcludedReason = quotaExcludedLabels.length > 0
+    ? `${quotaExcludedLabels.join("、")}，已从入口解析中剔除`
+    : "";
   const addedValues = values.filter((value) => !previousValues.has(value));
   const nextValues = new Set(values);
   const removedValues = Array.from(previousValues).filter((value) => !nextValues.has(value));
@@ -4203,14 +4388,23 @@ async function syncEntryGroupDdns(group: any, ddnsSettings: any, options: Forwar
   if (values.length === 0) {
     const requirement = recordTypeRequirementLabel(recordType);
     const reason = excluded.length > 0 ? `入口组没有健康的${requirement}` : `入口组没有可用${requirement}`;
+    const quotaAlertReason = quotaExcludedMemberIds.length > 0
+      ? await alertForwardGroupTrafficQuotaUnavailable({
+          group,
+          members,
+          quotaByMemberId: (group as any).trafficQuotaByMemberId || new Map(),
+          excludedMemberIds: quotaExcludedMemberIds,
+          options,
+        })
+      : "";
     if (group.ddnsAutoResolveEnabled === false) {
       await updateForwardGroupRuntimeIfChanged(db, group, {
         activeMemberId: null,
         lastStatus: "down",
-        lastMessage: `${reason}；自动解析已关闭，请手动清理解析`,
+        lastMessage: `${quotaAlertReason || reason}；自动解析已关闭，请手动清理解析`,
       });
     } else {
-      await preserveForwardGroupDdns(group, ddnsSettings, options, reason);
+      await preserveForwardGroupDdns(group, ddnsSettings, options, quotaAlertReason || reason);
     }
     return;
   }
@@ -4267,10 +4461,10 @@ async function syncEntryGroupDdns(group: any, ddnsSettings: any, options: Forwar
       lastDdnsAt: nowDate(),
       lastFailoverAt: nowDate(),
       lastStatus: "healthy",
-      lastMessage: `入口组 DDNS 已同步 ${values.length} 个入口${excludedSuffix}`,
+      lastMessage: `入口组 DDNS 已同步 ${values.length} 个入口${excludedSuffix}${quotaExcludedReason ? `；${quotaExcludedReason}` : ""}`,
       updatedAt: nowDate(),
     }).where(eq(forwardGroups.id, group.id));
-    await insertForwardGroupEvent(group.id, null, "ddns-update", `入口组 DDNS 已同步；domain=${String(group.domain || "-")} values=${joined}${excludedSuffix}${forceSync ? " force=true" : ""}`);
+    await insertForwardGroupEvent(group.id, null, "ddns-update", `入口组 DDNS 已同步${quotaExcludedReason ? `；${quotaExcludedReason}` : ""}；domain=${String(group.domain || "-")} values=${joined}${excludedSuffix}${forceSync ? " force=true" : ""}`);
     if (groupSwitchNotifyEnabled(group) && !switchNotifySuppressed(options) && previousValue && previousValue !== joined) {
       void notifyForwardGroupSwitch({
         groupId: Number(group.id),
@@ -4282,8 +4476,10 @@ async function syncEntryGroupDdns(group: any, ddnsSettings: any, options: Forwar
         fromValue: previousValue,
         toLabel: `${values.length} 个健康入口`,
         toValue: joined,
-        reason: removedValues.length > 0 && addedValues.length === 0
-          ? "入口异常达到故障观察时间，已自动剔除"
+        reason: quotaExcludedReason && removedValues.length > 0
+          ? quotaExcludedReason
+          : removedValues.length > 0 && addedValues.length === 0
+            ? "入口异常达到故障观察时间，已自动剔除"
           : addedValues.length > 0 && removedValues.length === 0
             ? "入口恢复达到稳定观察时间，已自动恢复"
             : "入口可用列表变化，已自动同步解析",
@@ -4341,6 +4537,7 @@ async function syncSingleForwardGroupDdns(
   const currentMessage = options.currentMessage || "DDNS 已是最新，解析记录已指向选中入口";
   const previousMemberId = Number(group.activeMemberId || 0);
   const previousValue = String(group.lastDdnsValue || "").trim();
+  const switchReasonSuffix = options.switchReason ? `；原因：${options.switchReason}` : "";
 
   if (options.beforeCommit && !(await options.beforeCommit())) return false;
 
@@ -4386,10 +4583,10 @@ async function syncSingleForwardGroupDdns(
       lastDdnsAt: nowDate(),
       lastFailoverAt: nowDate(),
       lastStatus: "healthy",
-      lastMessage: `${successMessage}到 ${value}`,
+      lastMessage: `${successMessage}到 ${value}${switchReasonSuffix}`,
       updatedAt: nowDate(),
     }).where(eq(forwardGroups.id, group.id));
-    await insertForwardGroupEvent(group.id, memberId, eventType, `${successMessage}；${detail}`);
+    await insertForwardGroupEvent(group.id, memberId, eventType, `${successMessage}${switchReasonSuffix}；${detail}`);
     if (groupSwitchNotifyEnabled(group) && !options.suppressSwitchNotify && previousMemberId > 0 && Number(previousMemberId) !== Number(memberId)) {
       const [fromLabel, toLabel] = await Promise.all([
         forwardGroupMemberLabel(options.previousMember, previousMemberId),
@@ -4435,21 +4632,23 @@ async function runForwardGroupFailoverForGroups(
 ) {
   const db = await getDb();
   const ddnsSettings = context?.ddnsSettings ?? await getDdnsSettings();
-  const hostById = context?.hostById ?? new Map((await getHosts() as any[]).map((host: any) => [Number(host.id), host]));
+  const hostById = context?.hostById ?? new Map<number, any>((await getHosts() as any[]).map((host: any) => [Number(host.id), host]));
   for (const group of groups as any[]) {
     if (!dbBool(group?.isEnabled)) continue;
     const mode = groupModeOf(group);
     if (mode === "chain" || mode === "port") continue;
-    if (mode === "entry") {
-      await syncEntryGroupDdns(group, ddnsSettings, options);
-      continue;
-    }
     if (mode === "exit") {
       await markExitGroupReady(group);
       continue;
     }
-    const recordType = normalizeForwardGroupRecordType(group.recordType);
     const members = [...(group.members || [])].sort((a, b) => Number(a.priority) - Number(b.priority));
+    const trafficQuotaByMemberId = await loadMemberTrafficFailoverStates(members, hostById);
+    (group as any).trafficQuotaByMemberId = trafficQuotaByMemberId;
+    if (mode === "entry") {
+      await syncEntryGroupDdns(group, ddnsSettings, options);
+      continue;
+    }
+    const recordType = normalizeForwardGroupRecordType(group.recordType);
     if (members.length === 0) continue;
     const chinaHealthExpiryAt = nextForwardGroupChinaHealthExpiryAt({
       enabled: dbBool(group.chinaHealthCheckEnabled),
@@ -4463,22 +4662,42 @@ async function runForwardGroupFailoverForGroups(
         pendingChinaHealth,
         agentFailurePending,
         agentLivenessRecheckAt,
-      } = await firstAvailableResolvableMember(members, group, recordType);
+        quotaExcludedMemberIds,
+      } = await firstAvailableResolvableMember(members, group, recordType, trafficQuotaByMemberId);
       const nextNoTemplateRecheckAt = [chinaHealthExpiryAt, agentLivenessRecheckAt]
         .filter((value): value is number => typeof value === "number" && value > Date.now())
         .sort((left, right) => left - right)[0] ?? null;
       forwardGroupHealthRechecks.replace(Number(group.id), nextNoTemplateRecheckAt);
       if (group.domain) {
         if (firstMember && firstValue && !agentFailurePending) {
+          const activeQuotaState = trafficQuotaByMemberId.get(Number(group.activeMemberId || 0));
+          const activeMember = members.find((member: any) => Number(member.id) === Number(group.activeMemberId || 0));
+          const quotaSwitchReason = activeQuotaState?.reached
+            ? `${activeQuotaState.hostName} 主机流量达到 ${activeQuotaState.thresholdPercent}% 阈值，已切换至 ${await forwardGroupMemberLabel(firstMember)}`
+            : "";
           const committed = await syncSingleForwardGroupDdns(group, firstMember, firstValue, ddnsSettings, {
             forceSync: !!options.forceSync,
             eventType: options.forcePriority ? "failover" : "ddns-update",
             successMessage: "DDNS 已切换",
             currentMessage: "DDNS 已是最新，解析记录已指向选中入口",
-            suppressSwitchNotify: true,
-            beforeCommit: () => memberAgentSelectionStillCurrent(firstMember),
+            suppressSwitchNotify: switchNotifySuppressed(options) || !quotaSwitchReason,
+            switchReason: quotaSwitchReason,
+            switchDetail: activeQuotaState?.reached ? hostTrafficFailoverDetail(activeQuotaState) : "",
+            previousMember: activeMember || null,
+            beforeCommit: async () => memberAgentSelectionStillCurrent(firstMember)
+              && !(await currentMemberTrafficQuotaReached(firstMember))
+              && (!activeQuotaState?.reached || (!!activeMember && await currentMemberTrafficQuotaReached(activeMember))),
           });
           if (committed === false) scheduleForwardGroupFailover([Number(group.id)]);
+        } else if (quotaExcludedMemberIds.length > 0) {
+          const quotaAlertReason = await alertForwardGroupTrafficQuotaUnavailable({
+            group,
+            members,
+            quotaByMemberId: trafficQuotaByMemberId,
+            excludedMemberIds: quotaExcludedMemberIds,
+            options,
+          });
+          await preserveForwardGroupDdns(group, ddnsSettings, options, quotaAlertReason || "没有健康备用成员（流量额度已达到故障转移阈值）");
         } else if (agentFailurePending) {
           await updateForwardGroupRuntimeIfChanged(db, group, {
             lastStatus: "unknown",
@@ -4494,11 +4713,22 @@ async function runForwardGroupFailoverForGroups(
         }
         continue;
       }
+      const quotaAlertReason = quotaExcludedMemberIds.length > 0 && !firstMember
+        ? await alertForwardGroupTrafficQuotaUnavailable({
+            group,
+            members,
+            quotaByMemberId: trafficQuotaByMemberId,
+            excludedMemberIds: quotaExcludedMemberIds,
+            options,
+          })
+        : "";
       await updateForwardGroupRuntimeIfChanged(db, group, {
         activeMemberId: Number(firstMember?.id || 0) || null,
         lastDdnsValue: firstValue || null,
-        lastStatus: agentFailurePending ? "unknown" : firstValue ? "healthy" : "unknown",
-        lastMessage: group.domain
+        lastStatus: agentFailurePending ? "unknown" : firstValue ? "healthy" : quotaAlertReason ? "down" : "unknown",
+        lastMessage: quotaAlertReason
+          ? `${quotaAlertReason}；当前还没有转发规则使用这个组。`
+          : group.domain
           ? `当前还没有转发规则使用这个组；${firstValue ? `建议入口 ${firstValue}` : `没有可用${recordTypeRequirementLabel(recordType)}。`}`
           : "当前还没有转发规则使用这个组。",
       });
@@ -4507,7 +4737,9 @@ async function runForwardGroupFailoverForGroups(
 
     if (!options.skipRuleSync) await syncForwardGroupRules(Number(group.id), { preserveRuntime: true });
     const evaluated = [];
-    for (const member of members) evaluated.push(await evaluateMemberHealth(member, group));
+    for (const member of members) {
+      evaluated.push(await evaluateMemberHealth(member, group, trafficQuotaByMemberId.get(Number(member.id || 0))));
+    }
 
     const healthWindowRecheckAt = nextForwardGroupHealthRecheckAt({
       members: evaluated,
@@ -4528,9 +4760,21 @@ async function runForwardGroupFailoverForGroups(
     if (!group.domain) {
       const anyHealthy = evaluated.some((member) => member.healthy);
       const anyPending = evaluated.some((member) => member.healthPending);
+      const quotaExcludedMembers = evaluated.filter((member: any) => member.trafficQuotaExceeded);
+      const quotaAlertReason = !anyHealthy && quotaExcludedMembers.length > 0
+        ? await alertForwardGroupTrafficQuotaUnavailable({
+            group,
+            members: evaluated,
+            quotaByMemberId: trafficQuotaByMemberId,
+            excludedMemberIds: quotaExcludedMembers.map((member: any) => Number(member.id || 0)),
+            options,
+          })
+        : "";
       await updateForwardGroupRuntimeIfChanged(db, group, {
-        lastStatus: anyHealthy ? "healthy" : anyPending ? "unknown" : "down",
-        lastMessage: anyPending
+        lastStatus: quotaAlertReason ? "down" : anyHealthy ? "healthy" : anyPending ? "unknown" : "down",
+        lastMessage: quotaAlertReason
+          ? `${quotaAlertReason}；未配置 DDNS 域名，仅更新成员健康状态。`
+          : anyPending
           ? "等待国内健康度检测结果；未配置 DDNS 域名，仅更新成员健康状态。"
           : "未配置 DDNS 域名，仅更新成员健康状态。",
       });
@@ -4573,12 +4817,18 @@ async function runForwardGroupFailoverForGroups(
       switchDetail = `恢复稳定时间已达到 ${Number(group.recoverSeconds || 120)} 秒`;
     } else if (shouldFailover) {
       next = firstHealthy;
-      switchReason = active
-        ? `${normalizeHealthReason(active.message)}导致切换`
-        : "当前没有可用活动入口，已自动选择健康成员";
-      switchDetail = active
-        ? `原入口异常持续已达到 ${Number(group.failoverSeconds || 60)} 秒；检测结果：${normalizeHealthReason(active.message)}`
-        : "未记录活动成员或活动成员已不存在";
+      if (active?.trafficQuotaExceeded && active.trafficQuotaState && next) {
+        const nextLabel = await forwardGroupMemberLabel(next);
+        switchReason = `${active.trafficQuotaState.hostName} 主机流量达到 ${active.trafficQuotaState.thresholdPercent}% 阈值，已切换至 ${nextLabel}`;
+        switchDetail = hostTrafficFailoverDetail(active.trafficQuotaState);
+      } else {
+        switchReason = active
+          ? `${normalizeHealthReason(active.message)}导致切换`
+          : "当前没有可用活动入口，已自动选择健康成员";
+        switchDetail = active
+          ? `原入口异常持续已达到 ${Number(group.failoverSeconds || 60)} 秒；检测结果：${normalizeHealthReason(active.message)}`
+          : "未记录活动成员或活动成员已不存在";
+      }
     }
 
     if (!next) {
@@ -4586,7 +4836,18 @@ async function runForwardGroupFailoverForGroups(
         scheduleForwardGroupFailover([Number(group.id)]);
         continue;
       }
-      await preserveForwardGroupDdns(group, ddnsSettings, options, "没有可用于 DDNS 故障转移的健康成员");
+      const quotaExcludedMembers = evaluated.filter((member: any) => member.trafficQuotaExceeded);
+      let quotaAlertReason = "";
+      if (quotaExcludedMembers.length > 0) {
+        quotaAlertReason = await alertForwardGroupTrafficQuotaUnavailable({
+          group,
+          members: evaluated,
+          quotaByMemberId: trafficQuotaByMemberId,
+          excludedMemberIds: quotaExcludedMembers.map((member: any) => Number(member.id || 0)),
+          options,
+        });
+      }
+      await preserveForwardGroupDdns(group, ddnsSettings, options, quotaAlertReason || "没有可用于 DDNS 故障转移的健康成员");
       continue;
     }
 
@@ -4619,6 +4880,7 @@ async function runForwardGroupFailoverByIds(groupIds: number[], options: Forward
   if (ids.length === 0) return;
 
   const ddnsSettings = await getDdnsSettings();
+  const hostById = new Map<number, any>((await getHosts() as any[]).map((host: any) => [Number(host.id), host]));
   const failures: Array<{ groupId: number; error: unknown }> = [];
   for (const groupId of ids) {
     try {
@@ -4627,7 +4889,7 @@ async function runForwardGroupFailoverByIds(groupIds: number[], options: Forward
         if (!group) return;
         const context: ForwardGroupFailoverContext = {
           ddnsSettings,
-          hostById: new Map(),
+          hostById,
         };
         await runForwardGroupFailoverForGroups([group], options, context);
       });

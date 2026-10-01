@@ -723,6 +723,11 @@ agentRouter.post("/api/agent/traffic", async (req: Request, res: Response) => {
         res.json({ success: true, duplicate: true });
         return;
       }
+      if (hostTraffic) {
+        await db.scheduleForwardGroupsForHostTrafficChange(Number(host.id)).catch((error: unknown) => {
+          console.warn(`[Agent Traffic] quota failover scheduling failed host=${host.id}: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      }
       const durationMs = Date.now() - requestStartedAt;
       logTrafficReportSummary({
         hostId: logHostId,
@@ -948,6 +953,12 @@ agentRouter.post("/api/agent/traffic", async (req: Request, res: Response) => {
       });
       res.json({ success: true, duplicate: true });
       return;
+    }
+
+    if (hostTraffic) {
+      await db.scheduleForwardGroupsForHostTrafficChange(Number(host.id)).catch((error: unknown) => {
+        console.warn(`[Agent Traffic] quota failover scheduling failed host=${host.id}: ${error instanceof Error ? error.message : String(error)}`);
+      });
     }
 
     const durationMs = Date.now() - requestStartedAt;
