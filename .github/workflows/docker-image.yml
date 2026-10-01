@@ -3,9 +3,12 @@ name: Docker Image
 on:
   workflow_call:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 env:
-  IMAGE_NAME: ghcr.io/poouo/forwardx
+  IMAGE_NAME: ghcr.io/xiaoliduck/forwardx
 
 permissions:
   contents: read
@@ -76,6 +79,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=ForwardX
             org.opencontainers.image.description=ForwardX port forwarding panel
+            org.opencontainers.image.source=https://github.com/xiaoliduck/Forwardx
             org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
             org.forwardx.version=${{ needs.prepare.outputs.version }}
           build-args: |
