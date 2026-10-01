@@ -3,16 +3,19 @@
 ForwardX 通过轻量 Agent 统一管理多台 Linux 服务器上的端口转发、加密隧道、转发链、故障转移、用户权限、套餐和流量统计。面板不保存主机 SSH 密钥。
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
-[![Latest Release](https://img.shields.io/github/v/release/poouo/Forwardx?display_name=tag&sort=semver)](https://github.com/poouo/Forwardx/releases/latest)
+[![Docker Image](https://github.com/xiaoliduck/Forwardx/actions/workflows/docker-image.yml/badge.svg?branch=main)](https://github.com/xiaoliduck/Forwardx/actions/workflows/docker-image.yml)
 [![Node.js](https://img.shields.io/badge/Node.js-22+-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 
 ## 链接
 
-- [使用文档](https://poouo.github.io/Forwardx/)
-- [GitHub Releases](https://github.com/poouo/Forwardx/releases/latest)
-- [Telegram 群组](https://t.me/ForwardX_panel)
-- [Android APK](https://github.com/poouo/Forwardx/releases/latest)
+- [本 Fork 源码](https://github.com/xiaoliduck/Forwardx)
+- [本 Fork Docker 镜像](https://github.com/xiaoliduck/Forwardx/pkgs/container/forwardx)
+- [上游使用文档](https://poouo.github.io/Forwardx/)
+- [上游 Telegram 群组](https://t.me/ForwardX_panel)
+- [上游 Android APK](https://github.com/poouo/Forwardx/releases/latest)
+
+> 本仓库是 [poouo/Forwardx](https://github.com/poouo/Forwardx) 的 Fork，额外提供主机流量阈值故障转移。Docker 镜像发布在 `ghcr.io/xiaoliduck/forwardx`；上游文档中的安装示例默认使用官方镜像，部署本 Fork 时请使用下文提供的命令。
 
 ## 主要功能
 
@@ -20,6 +23,7 @@ ForwardX 通过轻量 Agent 统一管理多台 Linux 服务器上的端口转发
 - 管理 GOST、ForwardX V1/V2 和 Nginx Stream 隧道，支持多跳、入口组、出口组和多出口。
 - 使用转发链组织固定的入口、中转和出口路径。
 - 使用转发组和 DDNS 实现多入口故障转移，支持 Cloudflare、华为云、阿里云、腾讯云 DNSPod 和 Webhook。
+- 支持主机流量阈值故障转移：达到每台主机配置的阈值后，自动跳过该主机并选择健康备用成员；默认阈值为流量额度的 95%。
 - 查看主机状态、规则流量、累计流量、延迟趋势、链路图、自测结果和系统日志。
 - 管理用户权限、流量与端口额度、套餐、余额、兑换码、折扣码和支付通道。
 - 支持邮件提醒、Telegram 通知、面板与 Agent 更新，以及 Android 客户端。
@@ -40,31 +44,43 @@ ForwardX 通过轻量 Agent 统一管理多台 Linux 服务器上的端口转发
 
 ## 快速部署
 
-面板默认访问端口为 `9810`。以下命令请使用 `root` 执行；非 `root` 环境可将 `bash` 替换为 `sudo bash`。
+面板默认访问端口为 `9810`。以下命令使用 `sudo` 执行安装器；如果当前终端已是 `root`，可去掉 `sudo`。使用本 Fork 的面板时，请显式指定本 Fork 的 Docker 镜像。
 
 ### Docker Compose
 
 安装：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-docker.sh | bash -s -- install
+curl -fsSL https://raw.githubusercontent.com/xiaoliduck/Forwardx/main/scripts/install-panel-docker.sh \
+  | sudo env FORWARDX_IMAGE=ghcr.io/xiaoliduck/forwardx:latest bash -s -- install
 ```
 
 升级：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-docker.sh | bash -s -- upgrade
+curl -fsSL https://raw.githubusercontent.com/xiaoliduck/Forwardx/main/scripts/install-panel-docker.sh \
+  | sudo env FORWARDX_IMAGE=ghcr.io/xiaoliduck/forwardx:latest bash -s -- upgrade
 ```
 
 卸载：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-docker.sh | bash -s -- uninstall
+curl -fsSL https://raw.githubusercontent.com/xiaoliduck/Forwardx/main/scripts/install-panel-docker.sh \
+  | sudo bash -s -- uninstall
 ```
 
-Docker 默认拉取 `ghcr.io/poouo/forwardx:latest`，数据库配置和 SQLite 数据保存在数据卷中。升级会保留 `.env`、数据卷和部署目录中的 `data/`；卸载脚本仅在用户确认后删除这些数据。
+Docker 镜像为 `ghcr.io/xiaoliduck/forwardx:latest`，数据库配置和 SQLite 数据保存在数据卷中。升级会保留 `.env`、数据卷和部署目录中的 `data/`；卸载脚本仅在用户确认后删除这些数据。每次升级都要保留 `FORWARDX_IMAGE` 参数；省略它会回到上游官方镜像。本 Fork 的面板内更新入口仍指向上游发行版，请使用本节命令升级以保留 Fork 功能。
 
-### 本地 systemd
+如果现有面板是通过上游官方命令安装的，也可以继续使用上游安装器升级，只覆盖镜像地址：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-docker.sh \
+  | sudo env FORWARDX_IMAGE=ghcr.io/xiaoliduck/forwardx:latest bash -s -- upgrade
+```
+
+### 本地 systemd（上游发行版）
+
+本 Fork 当前提供的是 Docker 镜像，尚未发布自己的本地安装包。下面的本地安装命令会获取上游发行版，不包含本 Fork 独有的流量阈值故障转移；需要此功能请使用上面的 Docker 部署方式。
 
 安装：
 
@@ -108,8 +124,8 @@ GitHub 访问不稳定时，可为 Docker 或本地安装脚本指定加速站�
 
 ```bash
 # Docker 安装
-curl -fsSL "https://mirror.example.com/https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-docker.sh" \
-  | bash -s -- install --github-accelerator "https://mirror.example.com"
+curl -fsSL "https://mirror.example.com/https://raw.githubusercontent.com/xiaoliduck/Forwardx/main/scripts/install-panel-docker.sh" \
+  | sudo env FORWARDX_IMAGE=ghcr.io/xiaoliduck/forwardx:latest bash -s -- install --github-accelerator "https://mirror.example.com"
 
 # 本地 systemd 安装
 curl -fsSL "https://mirror.example.com/https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-panel-local.sh" \
@@ -163,7 +179,7 @@ mimic 仅在用户为 ForwardX 隧道启用混淆时使用。V1 处理 FXP UDP�
 Agent 安装脚本会询问是否安装 mimic，默认选择 `n`。也可以手动执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/poouo/Forwardx/main/scripts/install-mimic.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/xiaoliduck/Forwardx/main/scripts/install-mimic.sh | sudo bash
 ```
 
 安装器默认使用 `wg-mimic-fabric v1.4.9` 安装或升级到 `mimic v0.7.1`；已满足目标版本时不会重复安装。可通过 `FORWARDX_MIMIC_VERSION` 和 `WMF_REF` 显式覆盖目标版本与安装器版本。
@@ -191,7 +207,7 @@ ForwardX 支持 SQLite、MySQL 和 PostgreSQL：
 | `DATABASE_TYPE` / `DB_TYPE` | 空 | 强制指定 `sqlite`、`mysql` 或 `postgresql` |
 | `JWT_SECRET` | 自动生成 | 登录签名密钥；生产环境应固定配置 |
 | `TELEGRAM_BOT_TOKEN` | 空 | Telegram 机器人 Token |
-| `FORWARDX_IMAGE` | `ghcr.io/poouo/forwardx:latest` | Docker 镜像 |
+| `FORWARDX_IMAGE` | — | 指定 Docker 镜像；本 Fork 的 Compose 默认值为 `ghcr.io/xiaoliduck/forwardx:latest` |
 
 ## 本地开发
 
@@ -238,4 +254,4 @@ under the MIT License. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Star 趋势
 
-[![Stargazers over time](https://starchart.cc/poouo/Forwardx.svg)](https://starchart.cc/poouo/Forwardx)
+[![Stargazers over time](https://starchart.cc/xiaoliduck/Forwardx.svg)](https://starchart.cc/xiaoliduck/Forwardx)
