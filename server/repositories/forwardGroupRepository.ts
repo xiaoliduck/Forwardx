@@ -72,7 +72,7 @@ import {
   reserveSpecificHostPort,
   type HostPortReservation,
 } from "../portReservations";
-import { repairPortForwardRuleHostReferences } from "../portForwardRuleHosts";
+import { repairForwardGroupTemplateHostReferences } from "../portForwardRuleHosts";
 import { summarizeForwardGroupRuntime } from "../forwardGroupRuntimeStatus";
 import { sqlBool } from "./repositoryUtils";
 import { normalizeExitGroupStrategy } from "@shared/exitStrategy";
@@ -3255,11 +3255,14 @@ async function syncForwardGroupRulesUnlocked(groupId: number, options: SyncForwa
   const preserveRuntime = !!options.preserveRuntime;
   const activeChainMembers = groupMode === "chain" ? members.filter((member: any) => dbBool(member?.isEnabled)) : members;
 
+  if (!isCollectionGroupMode(groupMode)) {
+    await repairForwardGroupTemplateHostReferences({ groupId });
+  }
+
   if (groupMode === "port") {
     if (members.length !== 1) throw new Error("端口转发需要配置 1 台所属主机");
     if (String(group.groupType || "host") !== "host") throw new Error("端口转发仅支持主机成员");
     if (members.some((member) => member.memberType !== "host")) throw new Error("端口转发仅支持主机成员");
-    await repairPortForwardRuleHostReferences(groupId);
   }
 
   const templates = await getForwardGroupTemplateRules(groupId);

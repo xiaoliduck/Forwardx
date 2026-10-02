@@ -40,8 +40,9 @@ test("repairs persisted port-forward hosts before host deletion checks", () => {
 
     await runtime.connectDatabase({ type: "sqlite", sqlite: { path: process.env.FORWARDX_TEST_DB } });
     await runtime.executeRaw('CREATE TABLE "users" ("id" INTEGER PRIMARY KEY, "username" TEXT NOT NULL, "name" TEXT)');
-    await runtime.executeRaw('CREATE TABLE "forward_groups" ("id" INTEGER PRIMARY KEY, "groupMode" TEXT NOT NULL)');
-    await runtime.executeRaw('CREATE TABLE "forward_group_members" ("id" INTEGER PRIMARY KEY, "groupId" INTEGER NOT NULL, "memberType" TEXT NOT NULL, "hostId" INTEGER, "priority" INTEGER NOT NULL, "ruleId" INTEGER)');
+    await runtime.executeRaw('CREATE TABLE "forward_groups" ("id" INTEGER PRIMARY KEY, "groupMode" TEXT NOT NULL, "entryGroupId" INTEGER, "isEnabled" INTEGER NOT NULL DEFAULT 1)');
+    await runtime.executeRaw('CREATE TABLE "forward_group_members" ("id" INTEGER PRIMARY KEY, "groupId" INTEGER NOT NULL, "memberType" TEXT NOT NULL, "hostId" INTEGER, "tunnelId" INTEGER, "priority" INTEGER NOT NULL, "ruleId" INTEGER, "isEnabled" INTEGER NOT NULL DEFAULT 1)');
+    await runtime.executeRaw('CREATE TABLE "tunnels" ("id" INTEGER PRIMARY KEY, "entryHostId" INTEGER NOT NULL)');
     await runtime.executeRaw('CREATE TABLE "forward_rules" ("id" INTEGER PRIMARY KEY, "hostId" INTEGER NOT NULL, "userId" INTEGER NOT NULL, "forwardGroupId" INTEGER, "forwardGroupRuleId" INTEGER, "forwardGroupMemberId" INTEGER, "isForwardGroupTemplate" INTEGER NOT NULL, "isEnabled" INTEGER NOT NULL, "pendingDelete" INTEGER NOT NULL, "isRunning" INTEGER NOT NULL, "updatedAt" INTEGER NOT NULL)');
     await runtime.executeRaw('CREATE TABLE "forward_rule_tunnel_exits" ("id" INTEGER PRIMARY KEY, "ruleId" INTEGER NOT NULL)');
     await runtime.executeRaw('INSERT INTO "users" ("id", "username", "name") VALUES (9, \'owner\', \'Owner\')');
@@ -93,6 +94,61 @@ test("repairs persisted port-forward hosts before host deletion checks", () => {
   }
 });
 
+test("repairs removed-member template hosts before host deletion while preserving live group references", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "forwardx-group-template-host-"));
+  const databasePath = path.join(directory, "repair.db");
+  const script = String.raw`
+    import assert from "node:assert/strict";
+    import path from "node:path";
+    import { pathToFileURL } from "node:url";
+
+    const moduleUrl = (file) => pathToFileURL(path.join(process.cwd(), file)).href;
+    const runtime = await import(moduleUrl("server/dbRuntime.ts"));
+    const schema = await import(moduleUrl("server/dbSchema.ts"));
+    const hostRepository = await import(moduleUrl("server/repositories/hostRepository.ts"));
+
+    await runtime.connectDatabase({ type: "sqlite", sqlite: { path: process.env.FORWARDX_TEST_DB } });
+    await schema.ensureDatabaseSchema();
+    await runtime.executeRaw('INSERT INTO "users" ("id", "username", "password", "name") VALUES (9, \'owner\', \'test\', \'Owner\')');
+    await runtime.executeRaw('INSERT INTO "hosts" ("id", "name", "ip", "userId") VALUES (1, \'removed\', \'192.0.2.1\', 9), (2, \'remaining\', \'192.0.2.2\', 9), (3, \'chain-a\', \'192.0.2.3\', 9), (4, \'chain-b\', \'192.0.2.4\', 9)');
+    await runtime.executeRaw('INSERT INTO "forward_groups" ("id", "name", "groupMode", "entryGroupId", "targetIp", "userId") VALUES (10, \'failover\', \'failover\', NULL, \'127.0.0.1\', 9), (20, \'still-uses-removed-host\', \'failover\', NULL, \'127.0.0.1\', 9), (30, \'chain\', \'chain\', 40, \'127.0.0.1\', 9), (40, \'entry\', \'entry\', NULL, \'127.0.0.1\', 9)');
+    await runtime.executeRaw('INSERT INTO "forward_group_members" ("id", "groupId", "memberType", "hostId", "priority", "isEnabled") VALUES (101, 10, \'host\', 2, 0, 1), (201, 20, \'host\', 1, 0, 1), (202, 20, \'host\', 3, 1, 1), (301, 30, \'host\', 3, 0, 1), (302, 30, \'host\', 4, 1, 1), (401, 40, \'host\', 2, 0, 1)');
+    await runtime.executeRaw('INSERT INTO "forward_rules" ("id", "hostId", "name", "sourcePort", "targetIp", "targetPort", "userId", "forwardGroupId", "isForwardGroupTemplate", "isEnabled", "pendingDelete", "isRunning") VALUES (100, 1, \'failover-rule\', 10000, \'127.0.0.1\', 80, 9, 10, 1, 1, 0, 1), (200, 1, \'live-reference\', 20000, \'127.0.0.1\', 80, 9, 20, 1, 1, 0, 1), (300, 1, \'chain-rule\', 30000, \'127.0.0.1\', 80, 9, 30, 1, 1, 0, 1)');
+
+    const removedHostBlockers = await hostRepository.getHostRuleDeleteBlockers(1);
+    assert.deepEqual(removedHostBlockers, {
+      ruleCount: 0,
+      ruleOwners: [],
+      managedRuleCount: 1,
+      managedRuleOwners: [{ userId: 9, username: "owner", name: "Owner", ruleCount: 1 }],
+      pendingCleanupCount: 0,
+    });
+    assert.deepEqual(
+      await runtime.queryRaw('SELECT "id", "hostId" FROM "forward_rules" WHERE "isForwardGroupTemplate" = 1 ORDER BY "id"'),
+      [{ id: 100, hostId: 2 }, { id: 200, hostId: 1 }, { id: 300, hostId: 2 }],
+    );
+
+    const remainingHostBlockers = await hostRepository.getHostRuleDeleteBlockers(2);
+    assert.equal(remainingHostBlockers.managedRuleCount, 2);
+    await runtime.closeDatabase();
+  `;
+
+  try {
+    const result = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", script], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        DATABASE_TYPE: "sqlite",
+        FORWARDX_TEST_DB: databasePath,
+      },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("pending rule cleanup never remains an active host delete blocker", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "forwardx-rule-cleanup-"));
   const databasePath = path.join(directory, "cleanup.db");
@@ -108,8 +164,9 @@ test("pending rule cleanup never remains an active host delete blocker", () => {
 
     await runtime.connectDatabase({ type: "sqlite", sqlite: { path: process.env.FORWARDX_TEST_DB } });
     await runtime.executeRaw('CREATE TABLE "users" ("id" INTEGER PRIMARY KEY, "username" TEXT NOT NULL, "name" TEXT)');
-    await runtime.executeRaw('CREATE TABLE "forward_groups" ("id" INTEGER PRIMARY KEY, "groupMode" TEXT NOT NULL)');
-    await runtime.executeRaw('CREATE TABLE "forward_group_members" ("id" INTEGER PRIMARY KEY, "groupId" INTEGER NOT NULL, "memberType" TEXT NOT NULL, "hostId" INTEGER, "priority" INTEGER NOT NULL, "ruleId" INTEGER, "updatedAt" INTEGER)');
+    await runtime.executeRaw('CREATE TABLE "forward_groups" ("id" INTEGER PRIMARY KEY, "groupMode" TEXT NOT NULL, "entryGroupId" INTEGER, "isEnabled" INTEGER NOT NULL DEFAULT 1)');
+    await runtime.executeRaw('CREATE TABLE "forward_group_members" ("id" INTEGER PRIMARY KEY, "groupId" INTEGER NOT NULL, "memberType" TEXT NOT NULL, "hostId" INTEGER, "tunnelId" INTEGER, "priority" INTEGER NOT NULL, "ruleId" INTEGER, "isEnabled" INTEGER NOT NULL DEFAULT 1, "updatedAt" INTEGER)');
+    await runtime.executeRaw('CREATE TABLE "tunnels" ("id" INTEGER PRIMARY KEY, "entryHostId" INTEGER NOT NULL)');
     await runtime.executeRaw('CREATE TABLE "forward_rules" ("id" INTEGER PRIMARY KEY, "hostId" INTEGER NOT NULL, "userId" INTEGER NOT NULL, "forwardGroupId" INTEGER, "forwardGroupRuleId" INTEGER, "forwardGroupMemberId" INTEGER, "isForwardGroupTemplate" INTEGER NOT NULL, "isEnabled" INTEGER NOT NULL, "pendingDelete" INTEGER NOT NULL, "isRunning" INTEGER NOT NULL, "updatedAt" INTEGER NOT NULL)');
     await runtime.executeRaw('CREATE TABLE "forward_rule_tunnel_exits" ("id" INTEGER PRIMARY KEY, "ruleId" INTEGER NOT NULL)');
     await runtime.executeRaw('INSERT INTO "users" ("id", "username", "name") VALUES (99, \'customer-a\', \'Customer A\')');

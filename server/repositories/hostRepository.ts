@@ -23,7 +23,7 @@ import {
 } from "../../drizzle/schema";
 import { executeRaw, getDb, insertAndGetId, nowDate, queryRaw, rawAffectedRows, refreshDatabasePoolSettings, withDatabaseTransaction } from "../dbRuntime";
 import { boolValue, inList, quoteIdentifier, sqlCountAll } from "../dbCompat";
-import { repairPortForwardRuleHostReferences } from "../portForwardRuleHosts";
+import { repairForwardGroupTemplateHostReferences, repairPortForwardRuleHostReferences } from "../portForwardRuleHosts";
 import { sqlBool } from "./repositoryUtils";
 import { repairForwardGroupRuleIntegrity } from "../forwardGroupRuleIntegrity";
 import { pageResult, pageWindowForTotal, type PageRequest } from "../../shared/pagination";
@@ -609,6 +609,7 @@ export async function deleteHost(id: number) {
   const db = await getDb();
   if (!db) return;
   const before = await getHostById(id).catch(() => undefined);
+  await repairForwardGroupTemplateHostReferences({ hostId: id });
   await repairPortForwardRuleHostReferences();
   await db.delete(forwardRules).where(eq(forwardRules.hostId, id));
   await db.delete(forwardRuleTunnelExits).where(eq(forwardRuleTunnelExits.exitHostId, id));
@@ -1010,6 +1011,7 @@ export async function getHostRuleDeleteBlockers(hostId: number) {
     managedRuleOwners: [],
     pendingCleanupCount: 0,
   };
+  await repairForwardGroupTemplateHostReferences({ hostId });
   await repairPortForwardRuleHostReferences();
   await repairForwardGroupRuleIntegrity(hostId);
   const managedRuleSql = sql`
